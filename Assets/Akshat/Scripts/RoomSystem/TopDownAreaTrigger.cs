@@ -28,6 +28,10 @@ namespace Akshat.RoomSystem
         [Tooltip("Priority when player leaves the area.")]
         [SerializeField] private int inactivePriority = 10;
 
+        [Header("Optional Room Ambience")]
+        [Tooltip("Optional RoomZone to activate ambience for when entering this trigger.")]
+        [SerializeField] private RoomZone areaRoom;
+
         private Collider2D triggerCollider;
 
         private void Awake()
@@ -52,6 +56,11 @@ namespace Akshat.RoomSystem
             if (areaCamera != null)
             {
                 areaCamera.Priority = activePriority;
+            }
+
+            if (areaRoom != null)
+            {
+                areaRoom.PlayAmbience();
             }
         }
 

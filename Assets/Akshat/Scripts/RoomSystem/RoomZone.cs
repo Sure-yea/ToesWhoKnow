@@ -28,10 +28,21 @@ namespace Akshat.RoomSystem
         [Tooltip("Optional background music or ambient audio clip for this room.")]
         [SerializeField] private AudioClip ambientAudio;
 
+        [Tooltip("Volume multiplier for this room's ambient audio (0 to 1).")]
+        [Range(0f, 1f)]
+        [SerializeField] private float ambientVolume = 1f;
+
+        [Tooltip("Whether this room's ambient audio should loop while inside.")]
+        [SerializeField] private bool loopAmbient = true;
+
         public string RoomName => roomName;
         public MovementMode MovementMode => movementMode;
         public CinemachineCamera RoomCamera => roomCamera;
         public AudioClip AmbientAudio => ambientAudio;
+        public float AmbientVolume => ambientVolume;
+        public bool LoopAmbient => loopAmbient;
+
+        private AudioSource localAudioSource;
 
         private void Reset()
         {
@@ -55,6 +66,86 @@ namespace Akshat.RoomSystem
             if (roomCamera == null)
             {
                 roomCamera = GetComponentInChildren<CinemachineCamera>();
+            }
+        }
+
+        private void Start()
+        {
+            // If PerspectiveTransitionManager is not handling room transitions in this scene,
+            // play ambience locally if this room is currently active.
+            if (Shaurya.PerspectiveTransitionManager.Instance == null && ambientAudio != null && gameObject.activeInHierarchy)
+            {
+                PlayLocalAmbience();
+            }
+        }
+
+        private void OnEnable()
+        {
+            if (Shaurya.PerspectiveTransitionManager.Instance == null && ambientAudio != null)
+            {
+                PlayLocalAmbience();
+            }
+        }
+
+        private void OnDisable()
+        {
+            if (Shaurya.PerspectiveTransitionManager.Instance == null && localAudioSource != null)
+            {
+                localAudioSource.Stop();
+            }
+        }
+
+        /// <summary>
+        /// Request this room's ambient audio to play.
+        /// </summary>
+        public void PlayAmbience()
+        {
+            if (Shaurya.PerspectiveTransitionManager.Instance != null)
+            {
+                Shaurya.PerspectiveTransitionManager.Instance.PlayRoomAmbience(this);
+            }
+            else
+            {
+                PlayLocalAmbience();
+            }
+        }
+
+        /// <summary>
+        /// Request this room's ambient audio to stop.
+        /// </summary>
+        public void StopAmbience()
+        {
+            if (Shaurya.PerspectiveTransitionManager.Instance != null)
+            {
+                Shaurya.PerspectiveTransitionManager.Instance.StopRoomAmbience();
+            }
+            else if (localAudioSource != null)
+            {
+                localAudioSource.Stop();
+            }
+        }
+
+        private void PlayLocalAmbience()
+        {
+            if (ambientAudio == null) return;
+
+            if (localAudioSource == null)
+            {
+                localAudioSource = GetComponent<AudioSource>();
+                if (localAudioSource == null)
+                {
+                    localAudioSource = gameObject.AddComponent<AudioSource>();
+                }
+                localAudioSource.playOnAwake = false;
+                localAudioSource.spatialBlend = 0f;
+            }
+
+            localAudioSource.clip = ambientAudio;
+            localAudioSource.volume = ambientVolume;
+            localAudioSource.loop = loopAmbient;
+            if (!localAudioSource.isPlaying)
+            {
+                localAudioSource.Play();
             }
         }
     }

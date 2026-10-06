@@ -49,13 +49,28 @@ namespace Shaurya
         [Tooltip("Optional list of rooms to manage. Auto-located if empty.")]
         [SerializeField] private Akshat.RoomSystem.RoomZone[] allRooms;
 
+        [Header("Room Ambience / Background Music")]
+        [Tooltip("Master volume multiplier for room ambient audio.")]
+        [Range(0f, 1f)]
+        [SerializeField] private float masterAmbienceVolume = 1f;
+
+        [Tooltip("Duration of crossfade when switching room music tracks (in seconds).")]
+        [SerializeField] private float musicFadeDuration = 0.5f;
+
         // ── State ─────────────────────────────────────────────────────────────
 
         public bool IsTransitioning { get; private set; }
+        public Akshat.RoomSystem.RoomZone CurrentRoom => currentRoom;
 
         private CinemachineCamera currentCamera;
         private Akshat.RoomSystem.RoomZone currentRoom;
         private CinemachineBrain brain;
+
+        private AudioSource musicSourceA;
+        private AudioSource musicSourceB;
+        private bool isUsingSourceA = true;
+        private Coroutine activeMusicFadeCoroutine;
+        private AudioClip currentPlayingClip;
 
         // ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -71,6 +86,8 @@ namespace Shaurya
                 Destroy(gameObject);
                 return;
             }
+
+            InitAudioSources();
 
             // Auto-locate player if unassigned
             if (playerMovement == null)
@@ -101,6 +118,21 @@ namespace Shaurya
                 allRooms = FindObjectsByType<Akshat.RoomSystem.RoomZone>(FindObjectsInactive.Include);
             }
 
+            // Fallback starting room if unassigned
+            if (startingRoom == null && allRooms != null && allRooms.Length > 0)
+            {
+                foreach (var room in allRooms)
+                {
+                    if (room != null && room.gameObject.activeSelf)
+                    {
+                        startingRoom = room;
+                        break;
+                    }
+                }
+                if (startingRoom == null)
+                    startingRoom = allRooms[0];
+            }
+
             // Disable all rooms except the starting room
             if (allRooms != null && allRooms.Length > 0)
             {
@@ -117,6 +149,7 @@ namespace Shaurya
             {
                 startingRoom.gameObject.SetActive(true);
                 currentRoom = startingRoom;
+                PlayRoomAmbience(currentRoom, instant: false);
             }
 
             // Disable all cameras if explicitly configured, then enable only the starting one
@@ -146,6 +179,12 @@ namespace Shaurya
                 Debug.LogError("[PerspectiveTransitionManager] Destination is null. Aborted.");
                 return;
             }
+
+            if (targetRoom == null && targetCamera != null)
+            {
+                targetRoom = targetCamera.GetComponentInParent<Akshat.RoomSystem.RoomZone>(true);
+            }
+
             BeginTransition(destination.position, targetMode, targetCamera, targetRoom);
         }
 
@@ -155,6 +194,11 @@ namespace Shaurya
             {
                 Debug.LogWarning("[PerspectiveTransitionManager] Already transitioning. Ignored.");
                 return;
+            }
+
+            if (targetRoom == null && targetCamera != null)
+            {
+                targetRoom = targetCamera.GetComponentInParent<Akshat.RoomSystem.RoomZone>(true);
             }
 
             StartCoroutine(TransitionCoroutine(destinationPosition, targetMode, targetCamera, targetRoom));
@@ -202,17 +246,20 @@ namespace Shaurya
                     currentRoom = targetRoom;
                 }
 
-                // ── 4. Switch movement mode (updates gravity scale & resets velocity) ──
+                // ── 4. Room Ambience / Music Transition ───────────────────────────
+                PlayRoomAmbience(currentRoom, instant: false);
+
+                // ── 5. Switch movement mode (updates gravity scale & resets velocity) ──
                 if (playerMovement != null)
                     playerMovement.SetMode(targetMode);
 
-                // ── 5. Instant camera switch ───────────────────────────────────────
+                // ── 6. Instant camera switch ───────────────────────────────────────
                 if (targetCamera != null)
                     SwitchCameraInstant(targetCamera, destinationPosition);
                 else
                     ApplyCameraForMode(targetMode, destinationPosition);
 
-                // ── 6. Physics & Render Sync ───────────────────────────────────────
+                // ── 7. Physics & Render Sync ───────────────────────────────────────
                 Physics2D.SyncTransforms();
                 yield return new WaitForFixedUpdate();
                 yield return null;
@@ -225,7 +272,7 @@ namespace Shaurya
                     playerMovement.SetMovementEnabled(true);
                 }
 
-                // ── 7. Fade back in ────────────────────────────────────────────────
+                // ── 8. Fade back in ────────────────────────────────────────────────
                 if (screenFader != null)
                     yield return StartCoroutine(screenFader.FadeIn());
             }
@@ -235,6 +282,199 @@ namespace Shaurya
                 if (playerMovement != null)
                     playerMovement.SetMovementEnabled(true);
             }
+        }
+
+        // ── Room Ambience & Music System ──────────────────────────────────────
+
+        private void InitAudioSources()
+        {
+            var sources = GetComponents<AudioSource>();
+            if (sources.Length > 0) musicSourceA = sources[0];
+            if (sources.Length > 1) musicSourceB = sources[1];
+
+            if (musicSourceA == null) musicSourceA = gameObject.AddComponent<AudioSource>();
+            if (musicSourceB == null) musicSourceB = gameObject.AddComponent<AudioSource>();
+
+            musicSourceA.playOnAwake = false;
+            musicSourceA.spatialBlend = 0f;
+            musicSourceA.loop = true;
+
+            musicSourceB.playOnAwake = false;
+            musicSourceB.spatialBlend = 0f;
+            musicSourceB.loop = true;
+        }
+
+        /// <summary>
+        /// Plays or transitions to the ambient audio configured on the given room.
+        /// If the room has the same audio clip already playing, it continues seamlessly.
+        /// </summary>
+        public void PlayRoomAmbience(Akshat.RoomSystem.RoomZone room, bool instant = false)
+        {
+            if (musicSourceA == null || musicSourceB == null)
+                InitAudioSources();
+
+            if (room == null || room.AmbientAudio == null)
+            {
+                StopRoomAmbience(instant ? 0f : musicFadeDuration);
+                return;
+            }
+
+            AudioClip newClip = room.AmbientAudio;
+            float targetVolume = Mathf.Clamp01(room.AmbientVolume * masterAmbienceVolume);
+            bool loop = room.LoopAmbient;
+
+            // If the same clip is already playing, preserve playback position and smoothly update volume
+            if (currentPlayingClip == newClip && ((isUsingSourceA && musicSourceA.isPlaying) || (!isUsingSourceA && musicSourceB.isPlaying)))
+            {
+                AudioSource activeSrc = isUsingSourceA ? musicSourceA : musicSourceB;
+                activeSrc.volume = targetVolume;
+                activeSrc.loop = loop;
+                return;
+            }
+
+            currentPlayingClip = newClip;
+
+            AudioSource fadeOutSource = isUsingSourceA ? musicSourceA : musicSourceB;
+            AudioSource fadeInSource = isUsingSourceA ? musicSourceB : musicSourceA;
+            isUsingSourceA = !isUsingSourceA;
+
+            fadeInSource.clip = newClip;
+            fadeInSource.loop = loop;
+
+            if (activeMusicFadeCoroutine != null)
+            {
+                StopCoroutine(activeMusicFadeCoroutine);
+                activeMusicFadeCoroutine = null;
+            }
+
+            if (instant || musicFadeDuration <= 0f)
+            {
+                if (fadeOutSource != null && fadeOutSource.isPlaying)
+                {
+                    fadeOutSource.Stop();
+                    fadeOutSource.volume = 0f;
+                }
+                fadeInSource.volume = targetVolume;
+                fadeInSource.Play();
+            }
+            else
+            {
+                activeMusicFadeCoroutine = StartCoroutine(CrossfadeMusicCoroutine(fadeOutSource, fadeInSource, targetVolume, musicFadeDuration));
+            }
+        }
+
+        /// <summary>
+        /// Stops the currently playing room music, fading out to silence.
+        /// </summary>
+        public void StopRoomAmbience(float fadeDuration = -1f)
+        {
+            if (fadeDuration < 0f) fadeDuration = musicFadeDuration;
+
+            currentPlayingClip = null;
+
+            if (activeMusicFadeCoroutine != null)
+            {
+                StopCoroutine(activeMusicFadeCoroutine);
+                activeMusicFadeCoroutine = null;
+            }
+
+            AudioSource activeSource = isUsingSourceA ? musicSourceA : musicSourceB;
+
+            if (fadeDuration <= 0f)
+            {
+                if (musicSourceA != null) { musicSourceA.Stop(); musicSourceA.volume = 0f; }
+                if (musicSourceB != null) { musicSourceB.Stop(); musicSourceB.volume = 0f; }
+            }
+            else if (activeSource != null && activeSource.isPlaying)
+            {
+                activeMusicFadeCoroutine = StartCoroutine(FadeOutMusicCoroutine(activeSource, fadeDuration));
+            }
+        }
+
+        /// <summary>
+        /// Sets master volume multiplier for room ambient audio.
+        /// </summary>
+        public void SetMasterAmbienceVolume(float volume)
+        {
+            masterAmbienceVolume = Mathf.Clamp01(volume);
+            if (currentRoom != null)
+            {
+                AudioSource activeSource = isUsingSourceA ? musicSourceA : musicSourceB;
+                if (activeSource != null && activeSource.isPlaying)
+                {
+                    activeSource.volume = currentRoom.AmbientVolume * masterAmbienceVolume;
+                }
+            }
+        }
+
+        private IEnumerator CrossfadeMusicCoroutine(AudioSource fadeOutSource, AudioSource fadeInSource, float targetVolume, float duration)
+        {
+            float elapsed = 0f;
+            float startOutVolume = (fadeOutSource != null && fadeOutSource.isPlaying) ? fadeOutSource.volume : 0f;
+
+            if (fadeInSource != null)
+            {
+                fadeInSource.volume = 0f;
+                fadeInSource.Play();
+            }
+
+            while (elapsed < duration)
+            {
+                elapsed += Time.unscaledDeltaTime;
+                float t = Mathf.Clamp01(elapsed / duration);
+
+                if (fadeOutSource != null && fadeOutSource.isPlaying)
+                {
+                    fadeOutSource.volume = Mathf.Lerp(startOutVolume, 0f, t);
+                }
+
+                if (fadeInSource != null)
+                {
+                    fadeInSource.volume = Mathf.Lerp(0f, targetVolume, t);
+                }
+
+                yield return null;
+            }
+
+            if (fadeOutSource != null)
+            {
+                fadeOutSource.Stop();
+                fadeOutSource.volume = 0f;
+            }
+
+            if (fadeInSource != null)
+            {
+                fadeInSource.volume = targetVolume;
+            }
+
+            activeMusicFadeCoroutine = null;
+        }
+
+        private IEnumerator FadeOutMusicCoroutine(AudioSource source, float duration)
+        {
+            float elapsed = 0f;
+            float startVolume = (source != null && source.isPlaying) ? source.volume : 0f;
+
+            while (elapsed < duration)
+            {
+                elapsed += Time.unscaledDeltaTime;
+                float t = Mathf.Clamp01(elapsed / duration);
+
+                if (source != null)
+                {
+                    source.volume = Mathf.Lerp(startVolume, 0f, t);
+                }
+
+                yield return null;
+            }
+
+            if (source != null)
+            {
+                source.Stop();
+                source.volume = 0f;
+            }
+
+            activeMusicFadeCoroutine = null;
         }
 
         // ── Camera Switching ──────────────────────────────────────────────────
